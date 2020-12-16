@@ -1233,6 +1233,106 @@ def decode_from_file(estimator,
 
 
 @gin.configurable
+def decode_from_dataset(estimator,
+                        vocabulary,
+                        model_type,
+                        batch_size,
+                        sequence_length,
+                        checkpoint_path=None,
+                        infer_dataset_fn=gin.REQUIRED,
+                        dataset_split="validation",
+                        decode_output_dir=gin.REQUIRED):
+  """Decode using inputs from the Task examples and writes results to files.
+
+  Args:
+    estimator: a TPUEstimator
+    vocabulary: a mtf.transformer.vocabulary.Vocabulary
+    model_type: a string
+    batch_size: an integer
+    sequence_length: an integer or a dict from feature-key to integer
+      the (packed) sequence length, e.g. {"inputs": 512, "targets": 128}
+    checkpoint_path: Checkpoint to use for inference.
+    infer_dataset_fn: A function returning a list of dataset.EvalDataset tuples.
+      See `eval_dataset_fn` argument to `eval_model` for details.
+    dataset_split: str, which dataset split to load.
+    decode_output_dir: a string, where to write inputs, targets, and decodes.
+  """
+  if model_type != "lm":
+    raise ValueError("This function currently only supports decoder-only LMs.")
+
+  infer_datasets = infer_dataset_fn(
+      sequence_length=sequence_length,
+      vocabulary=vocabulary,
+      dataset_split=dataset_split,)
+
+  cached_examples = {}
+
+  tf.logging.info("Caching inference examples.")
+  with tf.Graph().as_default():
+    for infer_dataset in infer_datasets:
+      ds = infer_dataset.dataset_fn()
+      # Create list of postprocessed text targets
+      inputs = []
+      targets = []
+      examples = []
+      for ex in tfds.as_numpy(ds):
+        examples.append(ex)
+      examples = _maybe_decode_python(examples, vocabulary)
+
+      targets = []
+      for ex in examples:
+        target_plaintext = ex["targets_plaintext"]
+        targets.append(infer_dataset.postprocess_fn(
+            target_plaintext, example=ex, is_target=True))
+      targets_filename = os.path.join(
+          decode_output_dir, "{}_targets".format(infer_dataset.name))
+      write_lines_to_file(targets, targets_filename)
+
+      inputs = [ex["inputs_plaintext"] for ex in examples]
+      inputs_filename = os.path.join(
+          decode_output_dir, "{}_inputs".format(infer_dataset.name))
+      write_lines_to_file(inputs, inputs_filename)
+
+      cached_examples[infer_dataset.name] = examples
+
+  def input_fn(params):
+    """Eval input function for estimator."""
+    del params
+
+    dataset = None
+    for infer_dataset in infer_datasets:
+      ds = infer_dataset.dataset_fn()
+      ds = ds.map(
+          _filter_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+      dataset = dataset.concatenate(ds) if dataset else ds
+
+    dataset = dataset.batch(batch_size, drop_remainder=False)
+    # Pad the final batch.
+    dataset = transformer_dataset.trim_and_pad_dataset(
+        dataset, length=batch_size)
+    dataset = dataset.prefetch(tf.data.experimental.AUTOTUNE)
+    return dataset
+
+  checkpoint_step = get_step_from_checkpoint_path(checkpoint_path)
+  decodes = decode(
+      estimator, input_fn, vocabulary, checkpoint_path=checkpoint_path)
+
+  for infer_dataset in infer_datasets:
+    # Extract the portion of decodes corresponding to this dataset
+    dataset_size = len(cached_examples[infer_dataset.name])
+    predictions = decodes[:dataset_size]
+
+    # Remove the used decodes.
+    del decodes[:dataset_size]
+
+    predictions_filename = os.path.join(
+        decode_output_dir,
+        "{}_{}_predictions".format(infer_dataset.name, checkpoint_step),
+    )
+    write_lines_to_file(predictions, predictions_filename)
+
+
+@gin.configurable
 def clean_decodes(ids, eos_id=1, pad_id=0, length_axis=-1):
   """Replaces everything after EOS with PAD (along last axis).
 
@@ -1279,16 +1379,16 @@ def save_scores(results, vocabulary,
     write_lines_to_file(["%f" % f for f in scores], scores_filename+".scores")
 
   if save_example_text:
+    results = _maybe_decode_python(results, vocabulary)
+
     # Targets will always exist.
     targets = [r.get("targets_pretokenized", r["targets"]) for r in results]
-    targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
     if scores_filename is not None:
       write_lines_to_file(targets, scores_filename+".targets")
 
     # Inputs may only exist for some tasks.
     if "inputs" in results[0]:
       inputs = [r.get("inputs_pretokenized", r["inputs"]) for r in results]
-      inputs = _maybe_decode_python(inputs, inputs_vocabulary(vocabulary))
       if scores_filename is not None:
         write_lines_to_file(inputs, scores_filename+".inputs")
       return scores, inputs, targets
@@ -1335,14 +1435,27 @@ def score_with_estimator(estimator, input_fn, eval_checkpoint_step, model_dir,
   return score_postprocess_fn(results, vocabulary)
 
 
-def _maybe_decode_python(ids_or_strs, vocabulary):
-  """Decode if ids_or_strs is not yet strings in pure python."""
+def _maybe_decode_python(examples, vocabulary):
+  """Ensures decoded versions of "inputs" and "targets" exist in each example.
 
-  if ids_or_strs:
-    if isinstance(ids_or_strs[0], np.ndarray) and np.issubdtype(
-        ids_or_strs[0].dtype, np.integer):
-      ids_or_strs = [vocabulary.decode(t.tolist()) for t in ids_or_strs]
-  return ids_or_strs
+  Args:
+    examples: List of example dictionaries containing mappings from feature
+        name to np.array of integers.
+    vocabulary: The vocabulary.
+
+  Returns:
+    examples dictionary with decoded plaintext entries for each feature in
+    features that was present in the original example.
+  """
+  vocabulary = {"inputs": inputs_vocabulary(vocabulary),
+                "targets": targets_vocabulary(vocabulary)}
+  for example in examples:
+    for feature_name in ["inputs", "targets"]:
+      plaintext_feature_name = feature_name + "_pretokenized"
+      if plaintext_feature_name not in example:
+        s = vocabulary[feature_name].decode(example[feature_name].tolist())
+        example[plaintext_feature_name] = s
+  return examples
 
 
 @gin.configurable
@@ -1669,10 +1782,8 @@ def infer_model(estimator,
                 model_type,
                 model_dir,
                 eval_checkpoint_step,
-                input_filename=None,
-                output_filename=None,
                 checkpoint_paths=None,
-                decode_from_file_fn=decode_from_file):
+                decode_fn=decode_from_file):
   """Infer a Mesh-TF model.
 
   Args:
@@ -1687,24 +1798,20 @@ def infer_model(estimator,
     model_dir: string, estimator model_dir
     eval_checkpoint_step: int, list of ints, or None, see `eval_model`
       docstring.
-    input_filename: a string, input file with examples
-    output_filename: a string, output file to save decodes
     checkpoint_paths: optional list of checkpoints to run inference for
-    decode_from_file_fn: decoding function, defaults to decode_from_file
+    decode_fn: decoding function, defaults to decode_from_file
   """
   if checkpoint_paths is None:
     checkpoint_paths = get_checkpoint_iterator(eval_checkpoint_step, model_dir)
 
   for checkpoint_path in checkpoint_paths:
-    decode_from_file_fn(
+    decode_fn(
         estimator,
         vocabulary=vocabulary,
         model_type=model_type,
         batch_size=batch_size,
         sequence_length=sequence_length,
-        checkpoint_path=checkpoint_path,
-        input_filename=input_filename,
-        output_filename=output_filename)
+        checkpoint_path=checkpoint_path)
 
 
 def eval_model(estimator,
@@ -1888,10 +1995,8 @@ def eval_model(estimator,
           estimator, input_fn, global_step, model_dir, vocabulary,
           num_examples=sum(len(cex) for cex in cached_examples.values()))
     else:
-      outputs = [
-          d.decode("utf-8") if isinstance(d, bytes) else d
-          for d in decode(estimator, input_fn, vocabulary, checkpoint_path)
-      ]
+      outputs = decode(estimator, input_fn, vocabulary, checkpoint_path)
+      outputs = [tf.compat.as_text(d) for d in outputs]
     for eval_dataset in eval_datasets:
       # Extract the portion of decodes corresponding to this dataset
       examples = cached_examples[eval_dataset.name]
