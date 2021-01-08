@@ -1282,6 +1282,18 @@ def save_scores(results, vocabulary,
     if scores_filename is not None:
       write_lines_to_file(targets, scores_filename+".targets")
 
+    # Write sequence lengths
+    def remove_padding_tokens(tokens):
+      idxs = np.where(tokens == 0)[0]
+      if len(idxs):  # pylint: disable=g-explicit-length-test
+        return tokens[:idxs[0]]
+      else:
+        return tokens
+
+    seq_lengths = [len(remove_padding_tokens(r["targets"])) for r in results]
+    if scores_filename is not None:
+      write_lines_to_file(seq_lengths, scores_filename+".lengths")
+
     # Inputs may only exist for some tasks.
     if "inputs" in results[0]:
       inputs = [r.get("inputs_pretokenized", r["inputs"]) for r in results]
