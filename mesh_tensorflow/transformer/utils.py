@@ -1250,7 +1250,7 @@ def clean_decodes(ids, eos_id=1, pad_id=0, length_axis=-1):
 
 @gin.configurable
 def save_scores(results, vocabulary,
-                scores_filename=None, save_example_text=True):
+                scores_filename=None, save_example_text=True, pad_id=0):
   """Processes results from scoring examples and maybe saves them to disk.
 
   Args:
@@ -1262,6 +1262,7 @@ def save_scores(results, vocabulary,
         are returned but not written to disk.
     save_example_text: a boolean - If True, then the text for each example is
         also saved/returned.
+    pad_id: int, PAD id.
 
   Returns:
     List of float scores, one score per example. If save_example_text is True,
@@ -1281,6 +1282,18 @@ def save_scores(results, vocabulary,
     targets = _maybe_decode_python(targets, targets_vocabulary(vocabulary))
     if scores_filename is not None:
       write_lines_to_file(targets, scores_filename+".targets")
+
+    # Write sequence lengths
+    def remove_padding_tokens(tokens):
+      idxs = np.where(tokens == pad_id)[0]
+      if len(idxs):  # pylint: disable=g-explicit-length-test
+        return tokens[:idxs[0]]
+      else:
+        return tokens
+
+    seq_lengths = [len(remove_padding_tokens(r["targets"])) for r in results]
+    if scores_filename is not None:
+      write_lines_to_file(seq_lengths, scores_filename+".lengths")
 
     # Inputs may only exist for some tasks.
     if "inputs" in results[0]:
@@ -1606,7 +1619,6 @@ def get_estimator(model_type, vocabulary, mesh_shape,
   return estimator
 
 
-@gin.configurable
 def train_model(estimator, vocabulary, sequence_length, batch_size,
                 train_dataset_fn, train_steps, ensemble_inputs,
                 dataset_split="train", skip_seen_data=False,
@@ -2282,6 +2294,7 @@ def run(tpu_job_name,
         ensemble_inputs=None,
         train_model_fn=train_model,
         skip_seen_data=False,
+        seen_data_init_step=0,
         output_eval_examples=True):
   """Run training, eval, or inference depending on `mode`.
 
@@ -2349,6 +2362,8 @@ def run(tpu_job_name,
       restarts to skip already seen data. This flag is only consistent when
       every setting (such as batch size and random seed) on the model is the
       same between the original run and the new run.
+    seen_data_init_step: an integer, when `skip_seen_data` is True, skip seen
+      steps from this starting point. Useful when finetuning.
     output_eval_examples: a boolean, is `True` by default. Used to decide
       whether to output whether to dump inputs, targets, and predictions of the
       eval examples in plaintext to eval_summary_dir.
@@ -2440,7 +2455,8 @@ def run(tpu_job_name,
 
     train_model_fn(estimator, vocabulary, sequence_length, batch_size,
                    train_dataset_fn, train_steps, ensemble_inputs,
-                   skip_seen_data=skip_seen_data)
+                   skip_seen_data=skip_seen_data,
+                   seen_data_init_step=seen_data_init_step)
 
   elif mode == "perplexity_eval":
     if eval_dataset_fn is None:
