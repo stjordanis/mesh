@@ -2096,3 +2096,24 @@ class LocalConvAttnBlock(transformer.TransformerLayer):
         name="local_conv_attn_op_projection")
 
     return op_projection
+
+
+@gin.configurable
+class ParallelLayer(transformer.TransformerLayer):
+  """Multiple layers in parallel.
+
+  Outputs are summed and divided by sqrt(n)."""
+
+  def __init__(self, layers=[DenseReluDense, SelfAttention]):
+    """Create a ParallelLayer.
+
+    Args:
+      layers: a list of TransformerLayer classes
+    """
+    self.layers = [l() for l in layers]
+
+  def call(self, context, x, losses=None):
+    """Call the layer."""
+    return (
+        mtf.add_n([l.call(context, x, losses=losses) for l in self.layers])
+        * (len(self.layers) ** -0.5))
